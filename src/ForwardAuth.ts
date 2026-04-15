@@ -74,6 +74,7 @@ class ForwardAuth {
 
 			const headers = new Headers({
 				'X-Auth-User': user.sub,
+				'X-Forwarded-User': user.sub,
 				'X-Auth-Info': JSON.stringify(user),
 			});
 
@@ -82,7 +83,7 @@ class ForwardAuth {
 					status: 200,
 					headers,
 				}),
-				session
+				session,
 			);
 		} else {
 			// user is not logged in, redirect to oauth endpoint
@@ -126,7 +127,7 @@ class ForwardAuth {
 				status: config.redirect_code,
 				headers: { Location: redirectUrl },
 			}),
-			session
+			session,
 		);
 	}
 
@@ -208,7 +209,7 @@ class ForwardAuth {
 					status: config.redirect_code,
 					headers: { Location: redirect },
 				}),
-				session
+				session,
 			);
 		} catch (error) {
 			this.log.error('handleOAuthCallback :: Error during token/userinfo exchange', error instanceof Error ? { message: error.message, stack: error.stack } : error, req);
@@ -347,7 +348,7 @@ class ForwardAuth {
 			cookieHeader.split(';').map((cookie) => {
 				const [name, value] = cookie.trim().split('=');
 				return [name, value];
-			})
+			}),
 		);
 
 		const cookie = cookies[this.config.cookie_name];
