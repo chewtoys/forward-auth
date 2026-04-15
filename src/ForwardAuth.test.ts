@@ -17,6 +17,7 @@ const config = {
 	scopes: 'test',
 	cookie_name: '__auth',
 	cookie_age: 604800,
+	callback_centralised: true,
 	log_level: 4,
 };
 
@@ -385,5 +386,238 @@ describe('OIDC Discovery functionality', () => {
 		} finally {
 			incompleteServer.stop();
 		}
+	});
+});
+
+describe('Centralized callback mode', () => {
+	// Separate forward-auth instance with centralized callback enabled.
+	// Primary auth on 8084, callback server on 8083.
+	// cookie_insecure=true so http:// origins are accepted in the state.
+	const centralConfig = {
+		listen_host: '127.0.0.1',
+		listen_port: 8084,
+		redirect_code: 302,
+		app_key: 'THIS_SHOULD_BE_CHANGED',
+		authorize_url: 'http://127.0.0.1:8081/login',
+		token_url: 'http://127.0.0.1:8081/token',
+		userinfo_url: 'http://127.0.0.1:8081/userinfo',
+		client_id: 'clientId',
+		client_secret: 'clientSecret',
+		allowed_users: 'testOkUser',
+		scopes: 'test',
+		cookie_name: '__auth',
+		cookie_age: 604800,
+		cookie_insecure: true,
+		callback_port: 8083,
+		callback_url: 'http://127.0.0.1:8083/callback',
+		callback_centralised: true,
+		log_level: 4,
+	};
+
+	const centralService = runForwardAuth(centralConfig);
+	let centralCookieJar = new TestCookieJar();
+
+	const centralFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
+		if (!options.headers) options.headers = {};
+		const cookieHeader = centralCookieJar.getCookieHeader();
+		if (cookieHeader) {
+			options.headers = { ...options.headers, Cookie: cookieHeader };
+		}
+		if (!('redirect' in options)) options.redirect = 'manual';
+		const response = await fetch(url, options);
+		const setCookieHeader = response.headers.get('Set-Cookie');
+		if (setCookieHeader) {
+			centralCookieJar.setCookie(setCookieHeader, new URL(url).hostname);
+		}
+		return response;
+	};
+
+	afterAll(() => {
+		centralService.server.stop();
+		centralService.callbackServer?.stop();
+	});
+
+	beforeEach(() => {
+		centralCookieJar = new TestCookieJar();
+		currentUser = 'testOkUser';
+	});
+
+	test('OAuth state parameter is a signed token (not a plain UUID)', async () => {
+		const response = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/protected',
+			},
+		});
+
+		expect(response.status).toBe(302);
+		const location = response.headers.get('location') || '';
+		expect(location.startsWith('http://127.0.0.1:8081/login')).toBe(true);
+
+		// State should be a signed token: base64url.signature (contains a dot)
+		const stateMatch = location.match(/[?&]state=([^&]+)/);
+		const stateParam = stateMatch ? decodeURIComponent(stateMatch[1]) : '';
+		expect(stateParam).toContain('.');
+	});
+
+	test('callback server returns 400 when code or state is missing', async () => {
+		const noCode = await fetch('http://127.0.0.1:8083/callback?state=something', { redirect: 'manual' });
+		expect(noCode.status).toBe(400);
+
+		const noState = await fetch('http://127.0.0.1:8083/callback?code=something', { redirect: 'manual' });
+		expect(noState.status).toBe(400);
+	});
+
+	test('callback server returns 400 for tampered state', async () => {
+		const response = await fetch('http://127.0.0.1:8083/callback?code=test&state=tampered.signature', { redirect: 'manual' });
+		expect(response.status).toBe(400);
+		expect(await response.text()).toBe('invalid state');
+	});
+
+	test('primary server returns 400 for tampered handoff token', async () => {
+		// First get a valid session cookie with a state nonce
+		const authResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/protected',
+			},
+		});
+		expect(authResponse.status).toBe(302);
+
+		// Submit a tampered handoff token
+		const response = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/_auth/callback?handoff=tampered.signature',
+			},
+		});
+		expect(response.status).toBe(400);
+		expect(await response.text()).toBe('invalid handoff token');
+	});
+
+	test('primary server returns 400 when handoff UUID does not match session state (CSRF)', async () => {
+		// Get a session cookie for one auth attempt (which stores a uuid as state)
+		const authResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/protected',
+			},
+		});
+		expect(authResponse.status).toBe(302);
+
+		// Simulate the callback server producing a handoff for a DIFFERENT uuid
+		// We do this by hitting the callback with a valid-looking but wrong state.
+		// Since we can't forge a signed state, let's use a fresh auth attempt's state
+		// from a separate cookie jar and try to use it with the original session.
+		const otherJar = new TestCookieJar();
+		const otherAuth = await fetch('http://127.0.0.1:8084/auth', {
+			redirect: 'manual',
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/protected',
+			},
+		});
+		const otherState = otherAuth.headers.get('location')?.match(/[?&]state=([^&]+)/)?.[1] || '';
+		const decodedOtherState = decodeURIComponent(otherState);
+		const otherSetCookie = otherAuth.headers.get('Set-Cookie') || '';
+		otherJar.setCookie(otherSetCookie, '127.0.0.1');
+
+		// Process this other state through the callback server
+		const cbResponse = await fetch(`http://127.0.0.1:8083/callback?code=test&state=${encodeURIComponent(decodedOtherState)}`, { redirect: 'manual' });
+		expect(cbResponse.status).toBe(302);
+		const handoffUrl = cbResponse.headers.get('location') || '';
+		const handoffParam = handoffUrl.match(/[?&]handoff=([^&]+)/)?.[1] || '';
+
+		// Now try to use that handoff with the ORIGINAL session cookie (different uuid → CSRF failure)
+		const response = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': `/_auth/callback?handoff=${handoffParam}`,
+			},
+		});
+		expect(response.status).toBe(400);
+		expect(await response.text()).toBe('invalid state');
+	});
+
+	test('full happy-path: auth → callback server → handoff → session set', async () => {
+		// Step 1: Initial auth request
+		const authResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/my-protected-page',
+			},
+		});
+		expect(authResponse.status).toBe(302);
+		const oauthRedirect = authResponse.headers.get('location') || '';
+		expect(oauthRedirect).toContain('redirect_uri=http%3A%2F%2F127.0.0.1%3A8083%2Fcallback');
+
+		// Step 2: Extract state and simulate OAuth provider redirecting to callback server
+		const stateMatch = oauthRedirect.match(/[?&]state=([^&]+)/);
+		const stateParam = stateMatch?.[1] || '';
+		expect(stateParam).toBeTruthy();
+
+		// Step 3: Hit the callback server (simulating the browser following the OAuth redirect)
+		const cbResponse = await fetch(
+			`http://127.0.0.1:8083/callback?code=test&state=${stateParam}`,
+			{ redirect: 'manual' },
+		);
+		expect(cbResponse.status).toBe(302);
+		const handoffRedirect = cbResponse.headers.get('location') || '';
+		// Should redirect back to the originating service's /_auth/callback
+		expect(handoffRedirect).toContain('127.0.0.1:8084/_auth/callback?handoff=');
+
+		// Step 4: The reverse proxy forwards /_auth/callback to the primary server
+		const handoffParam = handoffRedirect.match(/[?&]handoff=([^&]+)/)?.[1] || '';
+		const finalResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': `/_auth/callback?handoff=${handoffParam}`,
+			},
+		});
+		expect(finalResponse.status).toBe(302);
+		expect(finalResponse.headers.get('location')).toBe('http://127.0.0.1:8084/my-protected-page');
+
+		// Step 5: Subsequent request should be authenticated
+		const subsequentResponse = await centralFetch('http://127.0.0.1:8084/auth', { redirect: 'manual' });
+		expect(subsequentResponse.status).toBe(200);
+	});
+
+	test('disallowed user is rejected at primary server during handoff', async () => {
+		// Step 1: auth → get signed state
+		const authResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': '/protected',
+			},
+		});
+		const stateParam = authResponse.headers.get('location')?.match(/[?&]state=([^&]+)/)?.[1] || '';
+
+		// Step 2: callback server processes with a disallowed user
+		currentUser = 'testFailUser';
+		const cbResponse = await fetch(
+			`http://127.0.0.1:8083/callback?code=test&state=${stateParam}`,
+			{ redirect: 'manual' },
+		);
+		expect(cbResponse.status).toBe(302);
+		const handoffParam = cbResponse.headers.get('location')?.match(/[?&]handoff=([^&]+)/)?.[1] || '';
+
+		// Step 3: primary server rejects the disallowed user
+		const finalResponse = await centralFetch('http://127.0.0.1:8084/auth', {
+			headers: {
+				'x-forwarded-proto': 'http',
+				'x-forwarded-host': '127.0.0.1:8084',
+				'x-forwarded-uri': `/_auth/callback?handoff=${handoffParam}`,
+			},
+		});
+		expect(finalResponse.status).toBe(401);
 	});
 });

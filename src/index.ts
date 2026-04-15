@@ -50,6 +50,10 @@ const config = {
 	cookie_age: parseInt(process.env.COOKIE_AGE || '604800'), // 7 days
 	cookie_insecure: process.env.COOKIE_INSECURE === 'true',
 
+	callback_port: process.env.CALLBACK_PORT ? parseInt(process.env.CALLBACK_PORT) : undefined,
+	callback_url: process.env.CALLBACK_URL || undefined,
+	callback_centralised: process.env.CALLBACK_CENTRALISED !== 'false',
+
 	log_level: parseLogLevel(process.env.LOG_LEVEL),
 };
 

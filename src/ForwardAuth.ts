@@ -30,6 +30,9 @@ interface Config {
 	cookie_name: string;
 	cookie_age: number;
 	cookie_insecure: boolean;
+	callback_port?: number;
+	callback_url?: string;
+	callback_centralised: boolean;
 	log_level: LogLevel;
 }
 
@@ -48,6 +51,20 @@ interface OIDCDiscoveryDocument {
 	[key: string]: any;
 }
 
+// Payload embedded in the OAuth state parameter when centralized callback is enabled.
+// Signed with APP_KEY so origin cannot be tampered with.
+interface CentralizedState {
+	uuid: string;   // the session state nonce (also stored in session cookie)
+	origin: string; // e.g. "https://app-a.example.com"
+}
+
+// Payload the callback server sends back to the originating service.
+// Signed with APP_KEY so user info cannot be tampered with.
+interface HandoffPayload {
+	uuid: string; // must match session.state for CSRF protection
+	user: User;   // authenticated user info from the userinfo endpoint
+}
+
 class ForwardAuth {
 	config: Config;
 	log: Log;
@@ -61,6 +78,26 @@ class ForwardAuth {
 		this.cookieJar = new CookieJar(config.app_key);
 		this.discoveryCache = new Map();
 		this.discoveryCacheTime = new Map();
+	}
+
+	// Encode a payload as base64url(JSON).hmac
+	private signToken(payload: object): string {
+		const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+		return `${encoded}.${this.cookieJar.sign(encoded)}`;
+	}
+
+	// Verify and decode a token produced by signToken. Returns null on failure.
+	private verifyToken<T>(token: string): T | null {
+		const dot = token.lastIndexOf('.');
+		if (dot === -1) return null;
+		const encoded = token.slice(0, dot);
+		const sig = token.slice(dot + 1);
+		if (!this.cookieJar.verify(encoded, sig)) return null;
+		try {
+			return JSON.parse(Buffer.from(encoded, 'base64url').toString()) as T;
+		} catch {
+			return null;
+		}
 	}
 
 	async handleAuthCheck(req: Request, url: URL): Promise<Response> {
@@ -102,13 +139,14 @@ class ForwardAuth {
 			return new Response('invalid request', { status: 401 });
 		}
 
-		const state = Bun.randomUUIDv7('base64url');
+		const uuid = Bun.randomUUIDv7('base64url');
 		const scope = config.scopes || '';
 
 		const redirectUri = this.getRedirectUri(req);
 
+		// Session cookie always stores the raw uuid as state
 		const session: Session = {
-			state,
+			state: uuid,
 			expiresAt: this.unixtime() + this.config.cookie_age,
 		};
 
@@ -118,7 +156,21 @@ class ForwardAuth {
 			this.log.debug(`handleOAuthRedirect :: Setting redirect destination to ${forwardedUri.href}`, req);
 		}
 
-		const redirectUrl = `${config.authorize_url}?client_id=${config.client_id}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&state=${state}`;
+		// In centralized mode, embed the service origin in the OAuth state parameter (signed).
+		// In direct mode, the state parameter is just the plain uuid.
+		let oauthState: string;
+		if (this.config.callback_url && this.config.callback_centralised) {
+			const centralizedState: CentralizedState = {
+				uuid,
+				origin: this.getOrigin(req),
+			};
+			oauthState = this.signToken(centralizedState);
+			this.log.debug('handleOAuthRedirect :: Using centralized callback, signed state token', req);
+		} else {
+			oauthState = uuid;
+		}
+
+		const redirectUrl = `${config.authorize_url}?client_id=${config.client_id}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(oauthState)}`;
 
 		this.log.info(`handleOAuthRedirect :: Redirecting to ${redirectUrl}`, req);
 
@@ -133,6 +185,13 @@ class ForwardAuth {
 
 	async handleOAuthCallback(browserQuery: Record<string, string>, req: Request): Promise<Response> {
 		this.log.debug('handleOAuthCallback :: Processing OAuth callback', req);
+
+		// Centralized handoff path: the callback server already exchanged the code
+		// and is handing off the authenticated user to this service domain.
+		if (browserQuery.handoff) {
+			return this.handleHandoff(browserQuery.handoff, req);
+		}
+
 		const session = await this.getSession(req);
 
 		if (!browserQuery.code) {
@@ -217,7 +276,169 @@ class ForwardAuth {
 		}
 	}
 
+	// Handle the handoff from the centralized callback server.
+	// Verifies the signed handoff token, CSRF-checks uuid vs session.state,
+	// validates allowed_users, and sets the session cookie.
+	private async handleHandoff(handoffToken: string, req: Request): Promise<Response> {
+		this.log.debug('handleHandoff :: Processing centralized handoff', req);
+
+		const session = await this.getSession(req);
+		if (!session) {
+			this.log.warn('handleHandoff :: No session cookie present', req);
+			return new Response('invalid session', { status: 400 });
+		}
+
+		const handoff = this.verifyToken<HandoffPayload>(handoffToken);
+		if (!handoff) {
+			const ip = req.headers.get('x-forwarded-for') || 'unknown';
+			this.log.warn(`handleHandoff :: Invalid handoff token signature from IP ${ip}`, req);
+			return new Response('invalid handoff token', { status: 400 });
+		}
+
+		// CSRF check: the uuid in the handoff must match the state nonce in the session cookie.
+		// The session cookie is scoped to the originating service domain, so a CSRF attacker
+		// cannot produce a handoff token that matches the cookie of a different user's session.
+		if (handoff.uuid !== session.state) {
+			const ip = req.headers.get('x-forwarded-for') || 'unknown';
+			this.log.warn(`handleHandoff :: UUID mismatch (CSRF protection) from IP ${ip}`, req);
+			return new Response('invalid state', { status: 400 });
+		}
+
+		delete session.state;
+
+		const userinfo = handoff.user;
+		if (!userinfo || !userinfo.sub) {
+			this.log.error('handleHandoff :: Handoff payload missing user sub', req);
+			return new Response('invalid user info', { status: 401 });
+		}
+
+		// allowed_users must be enforced here on the primary server because per-request
+		// query param overrides (e.g. ?allowed_users=alice) are not available on the
+		// callback server — they only arrive via the reverse proxy on the /auth route.
+		const query = Object.fromEntries(new URL(req.url).searchParams);
+		const config = await this.getConfigWithDiscovery(query);
+		if (config.allowed_users) {
+			const allowedUsers = config.allowed_users.split(',');
+			if (!allowedUsers.includes(userinfo.sub)) {
+				this.log.warn(`handleHandoff :: User ${userinfo.sub} not in allowed users list`, req);
+				return new Response('user not allowed', { status: 401 });
+			}
+		}
+
+		session.user = userinfo;
+		const redirect = session.redirect || this.getOrigin(req);
+		this.log.info(`handleHandoff :: Handoff successful for user ${userinfo.sub}, redirecting to ${redirect}`, req);
+
+		return this.setSessionCookie(
+			new Response(null, {
+				status: this.config.redirect_code,
+				headers: { Location: redirect },
+			}),
+			session,
+		);
+	}
+
+	// Handle an OAuth callback on the secondary (centralized) callback server.
+	// Verifies the signed state, exchanges the code for a token, fetches user info,
+	// and redirects to the originating service with a signed handoff token.
+	async handleCentralizedCallback(req: Request, url: URL): Promise<Response> {
+		this.log.debug('handleCentralizedCallback :: Processing centralized OAuth callback', req);
+
+		const params = Object.fromEntries(url.searchParams);
+
+		if (!params.code || !params.state) {
+			this.log.warn('handleCentralizedCallback :: Missing code or state', req);
+			return new Response('invalid request', { status: 400 });
+		}
+
+		// Verify and decode the signed state to get uuid and originating service origin
+		const centralizedState = this.verifyToken<CentralizedState>(params.state);
+		if (!centralizedState || !centralizedState.uuid || !centralizedState.origin) {
+			this.log.warn('handleCentralizedCallback :: Invalid or tampered state parameter', req);
+			return new Response('invalid state', { status: 400 });
+		}
+
+		// Validate the origin before using it in a redirect
+		let originUrl: URL;
+		try {
+			originUrl = new URL(centralizedState.origin);
+		} catch {
+			this.log.warn(`handleCentralizedCallback :: Invalid origin in state: ${centralizedState.origin}`, req);
+			return new Response('invalid state origin', { status: 400 });
+		}
+
+		// Only allow https origins (and http when cookie_insecure is set for development)
+		const allowedProtocols = this.config.cookie_insecure ? ['http:', 'https:'] : ['https:'];
+		if (!allowedProtocols.includes(originUrl.protocol)) {
+			this.log.warn(`handleCentralizedCallback :: Disallowed protocol in state origin: ${originUrl.protocol}`, req);
+			return new Response('invalid state origin', { status: 400 });
+		}
+
+		const config = await this.getConfigWithDiscovery({});
+
+		try {
+			const tokenResponse = await fetch(config.token_url, {
+				method: 'POST',
+				body: new URLSearchParams({
+					client_id: config.client_id || '',
+					client_secret: config.client_secret || '',
+					code: params.code,
+					grant_type: 'authorization_code',
+					redirect_uri: this.config.callback_url || '',
+				}),
+			});
+
+			const tokenJson: TokenResponse = await tokenResponse.json();
+
+			if (!tokenJson || !tokenJson.access_token) {
+				this.log.error('handleCentralizedCallback :: Invalid or missing access token', req);
+				return new Response('invalid access_token', { status: 401 });
+			}
+
+			this.log.debug('handleCentralizedCallback :: Got access token, fetching user info', req);
+			const userinfoResponse = await fetch(config.userinfo_url, {
+				headers: { authorization: 'Bearer ' + tokenJson.access_token },
+			});
+
+			if (!userinfoResponse.ok) {
+				this.log.error(`handleCentralizedCallback :: Failed to fetch user info: ${userinfoResponse.status} ${userinfoResponse.statusText}`, req);
+				return new Response('failed to fetch user info', { status: 401 });
+			}
+
+			const userinfo: User = await userinfoResponse.json();
+
+			if (!userinfo || !userinfo.sub) {
+				this.log.error('handleCentralizedCallback :: Invalid user info: missing sub', req);
+				return new Response('invalid user info', { status: 401 });
+			}
+
+			this.log.debug(`handleCentralizedCallback :: User info retrieved: ${userinfo.sub}`, req);
+
+			// Build the signed handoff token and redirect to the originating service.
+			// Use originUrl.origin (not raw string) to prevent path injection via the state.
+			const handoffPayload: HandoffPayload = { uuid: centralizedState.uuid, user: userinfo };
+			const handoffToken = this.signToken(handoffPayload);
+
+			const handoffUrl = new URL('/_auth/callback', originUrl.origin);
+			handoffUrl.searchParams.set('handoff', handoffToken);
+
+			this.log.info(`handleCentralizedCallback :: Redirecting handoff for user ${userinfo.sub} to ${handoffUrl.origin}/_auth/callback`, req);
+
+			return new Response(null, {
+				status: 302,
+				headers: { Location: handoffUrl.href },
+			});
+		} catch (error) {
+			this.log.error('handleCentralizedCallback :: Error during token/userinfo exchange', error instanceof Error ? { message: error.message, stack: error.stack } : error, req);
+			return new Response('authentication error', { status: 500 });
+		}
+	}
+
 	getRedirectUri(req: Request): string {
+		if (this.config.callback_url && this.config.callback_centralised) {
+			this.log.debug(`getRedirectUri :: Using centralized callback URL: ${this.config.callback_url}`, req);
+			return this.config.callback_url;
+		}
 		const uri = this.getOrigin(req) + '/_auth/callback';
 		this.log.debug(`getRedirectUri :: Callback URI: ${uri}`, req);
 		return uri;
@@ -297,6 +518,10 @@ class ForwardAuth {
 
 		if (query.allowed_users) {
 			config.allowed_users = query.allowed_users;
+		}
+
+		if (query.callback_centralised !== undefined) {
+			config.callback_centralised = query.callback_centralised !== 'false';
 		}
 
 		return config;
@@ -410,6 +635,10 @@ export function runForwardAuth(config: Config) {
 	log.setLogLevel(config.log_level);
 	const forwardAuth = new ForwardAuth(config, log);
 
+	if (!!config.callback_port !== !!config.callback_url) {
+		log.warn('forwardAuth :: CALLBACK_PORT and CALLBACK_URL should both be set when using centralized callback mode');
+	}
+
 	const server = Bun.serve({
 		port: config.listen_port,
 		hostname: config.listen_host,
@@ -419,7 +648,7 @@ export function runForwardAuth(config: Config) {
 			// Check if this is an OAuth callback
 			const forwardedUri = forwardAuth.getForwardedUri(req);
 			if (forwardedUri && forwardedUri.pathname === '/_auth/callback') {
-				// We need code from the real URL the browser sends
+				// We need code/handoff from the real URL the browser sends
 				const query = Object.fromEntries(forwardedUri.searchParams);
 				return await forwardAuth.handleOAuthCallback(query, req);
 			}
@@ -435,5 +664,21 @@ export function runForwardAuth(config: Config) {
 
 	log.info(`forwardAuth :: listening on http://${config.listen_host}:${config.listen_port}`);
 
-	return { server, forwardAuth, log };
+	let callbackServer: ReturnType<typeof Bun.serve> | undefined;
+	if (config.callback_port) {
+		callbackServer = Bun.serve({
+			port: config.callback_port,
+			hostname: config.listen_host,
+			async fetch(req) {
+				const url = new URL(req.url);
+				if (url.pathname === '/callback') {
+					return await forwardAuth.handleCentralizedCallback(req, url);
+				}
+				return new Response('Not found', { status: 404 });
+			},
+		});
+		log.info(`forwardAuth :: centralized callback server listening on http://${config.listen_host}:${config.callback_port}`);
+	}
+
+	return { server, callbackServer, forwardAuth, log };
 }

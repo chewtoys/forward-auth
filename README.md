@@ -10,49 +10,106 @@ forward-auth can be configured in two ways, values are applied in following prio
 
 `environment variables < query params`
 
-Please use UPPER_CASE in environment variables, lower_case otherwise. Note that listen_host, listen_port, app_key, cookie_name and cookie_age cannot be set via query params.
+Note that `LISTEN_HOST`, `LISTEN_PORT`, `APP_KEY`, `COOKIE_NAME`, `COOKIE_AGE`, `CALLBACK_PORT`, and `CALLBACK_URL` can only be set via environment variables, not query params.
 
 The following options are available:
 
-| Config Key      | Description                                                                                                                       | Required | Default           |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------- |
-| listen_host     | host to bind                                                                                                                      |          | `0.0.0.0`         |
-| listen_port     | port to bind                                                                                                                      |          | `8080`            |
-| app_key         | keys for cookie signing                                                                                                           | ✔        | min. 32 byte      |
-| cookie_name     | Name of Cookie                                                                                                                    |          | `__auth`          |
-| cookie_age      | Max age of cookie in seconds                                                                                                      |          | `604800` (7 days) |
-| cookie_insecure | Allow cookies over insecure (HTTP) connections. Set to `true` for development, should be `false` in production                    |          | `false`           |
-| redirect_code   | HTTP status code to return, when redirecting<sup>[because](http://nginx.org/en/docs/http/ngx_http_auth_request_module.html)</sup> |          | 302               |
-| discovery_url   | OpenID Connect Discovery URL, used to auto-configure authorize_url, token_url and userinfo_url                                    |          |                   |
-| authorize_url   | OAuth Authorization Request URL ([spec](https://tools.ietf.org/html/rfc6749#section-4.1.1))                                       | ✔\*      |                   |
-| token_url       | OAuth Access Token Endpoint                                                                                                       | ✔\*      |                   |
-| userinfo_url    | OpenID Connect UserInfo endpoint, must include `sub` field                                                                        | ✔\*      |                   |
-| client_id       | OAuth Client Id                                                                                                                   | ✔        |                   |
-| client_secret   | OAuth Client Secret                                                                                                               | ✔        |                   |
-| allowed_users   | Comma-seperated list of allowed `sub`s, empty = anyone                                                                            |          | `[]`              |
-| scopes          | Comma-seperated OAuth Scopes                                                                                                      |          | `id`              |
-| log_level       | Log level (DEBUG, INFO, WARN, ERROR, NONE)                                                                                        |          | `INFO`            |
+| Environment Variable | Description                                                                                                                       | Required | Default           |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------- |
+| `LISTEN_HOST`        | Host to bind                                                                                                                      |          | `0.0.0.0`         |
+| `LISTEN_PORT`        | Port to bind                                                                                                                      |          | `8080`            |
+| `APP_KEY`            | Key for cookie signing (min. 32 characters)                                                                                       | ✔        |                   |
+| `COOKIE_NAME`        | Name of the session cookie                                                                                                        |          | `__auth`          |
+| `COOKIE_AGE`         | Max age of cookie in seconds                                                                                                      |          | `604800` (7 days) |
+| `COOKIE_INSECURE`    | Allow cookies over insecure (HTTP) connections. Set to `true` for development, should be `false` in production                    |          | `false`           |
+| `REDIRECT_CODE`      | HTTP status code to return when redirecting<sup>[because](http://nginx.org/en/docs/http/ngx_http_auth_request_module.html)</sup>  |          | `302`             |
+| `DISCOVERY_URL`      | OpenID Connect Discovery URL, used to auto-configure `AUTHORIZE_URL`, `TOKEN_URL`, and `USERINFO_URL`                             |          |                   |
+| `AUTHORIZE_URL`      | OAuth Authorization Request URL ([spec](https://tools.ietf.org/html/rfc6749#section-4.1.1))                                       | ✔\*      |                   |
+| `TOKEN_URL`          | OAuth Access Token Endpoint                                                                                                       | ✔\*      |                   |
+| `USERINFO_URL`       | OpenID Connect UserInfo endpoint, must include `sub` field                                                                        | ✔\*      |                   |
+| `CLIENT_ID`          | OAuth Client ID                                                                                                                   | ✔        |                   |
+| `CLIENT_SECRET`      | OAuth Client Secret                                                                                                               | ✔        |                   |
+| `ALLOWED_USERS`      | Comma-separated list of allowed `sub` values; empty = anyone                                                                      |          | `[]`              |
+| `SCOPES`             | Comma-separated OAuth scopes                                                                                                      |          | `id`              |
+| `CALLBACK_PORT`        | Port for the centralized callback server (see [Centralized Callback](#centralized-callback)); disabled when unset                      |          |                   |
+| `CALLBACK_URL`         | Public URL of the centralized callback endpoint, e.g. `https://auth-cb.example.com/callback` (required when `CALLBACK_PORT` set)      |          |                   |
+| `CALLBACK_CENTRALISED` | Enable/disable centralized callback mode (`true`/`false`). Can be overridden per-request via query param (`?callback_centralised=false`) |          | `true`            |
+| `LOG_LEVEL`          | Log level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `NONE`)                                                                              |          | `INFO`            |
 
-\* You can either provide individual URLs (authorize_url, token_url, userinfo_url) OR use discovery_url to automatically fetch them from an OpenID Connect provider's discovery document.
+\* You can either provide individual URLs (`AUTHORIZE_URL`, `TOKEN_URL`, `USERINFO_URL`) OR use `DISCOVERY_URL` to automatically fetch them from an OpenID Connect provider's discovery document.
 
-When client is authenticated, forward_auth passes X-Auth-User with the sub and X-Auth-Info with the json encoded userinfo_url response, those may be passed to your application via the reverse proxy (see example below).
+When a client is authenticated, forward-auth passes `X-Auth-User` with the `sub` and `X-Auth-Info` with the JSON-encoded `USERINFO_URL` response. These can be forwarded to your application via the reverse proxy (see examples below).
 
 > [!WARNING] > **Security Note on `X-Forwarded-*` Headers**
 > This service relies on `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-Uri` headers to construct redirect URLs and identify the original request. It is critical that your reverse proxy is configured to **overwrite** these headers and not trust the values provided by incoming client requests. Failure to do so can lead to open redirect vulnerabilities. The provided examples for Traefik and Nginx demonstrate a secure configuration.
 
 ## OpenID Connect Discovery
 
-If your identity provider supports OpenID Connect, you can use the discovery_url parameter instead of manually configuring the endpoint URLs.
+If your identity provider supports OpenID Connect, you can use `DISCOVERY_URL` instead of manually configuring the individual endpoint URLs.
 The service will automatically fetch the standard endpoints from the provider's discovery document available at `/.well-known/openid-configuration`.
 
 For example, with Google:
 
 ```
-discovery_url=https://accounts.google.com
+DISCOVERY_URL=https://accounts.google.com
 ```
 
-This will automatically configure authorize_url, token_url, and userinfo_url based on the discovery document.
+This will automatically configure `AUTHORIZE_URL`, `TOKEN_URL`, and `USERINFO_URL` based on the discovery document.
 If you provide any of these URLs explicitly, they will override the values from the discovery document.
+
+## Centralized Callback
+
+By default, the OAuth `redirect_uri` is derived from the service being accessed (e.g. `https://app-a.example.com/_auth/callback`), which means every protected service needs its own callback URL registered with the OAuth provider.
+
+Setting `CALLBACK_PORT` and `CALLBACK_URL` enables a **centralized callback server** on a separate port, so you only need to register a single callback URL with your OAuth provider — regardless of how many services are protected.
+
+```
+CALLBACK_PORT=8081
+CALLBACK_URL=https://auth-callback.example.com/callback
+```
+
+The secondary server listens on `CALLBACK_PORT` and exposes a single `GET /callback` endpoint. It must be reachable at `CALLBACK_URL` by the browser (i.e. exposed via your reverse proxy or directly).
+
+### How it works
+
+1. An unauthenticated user visits a protected service
+2. forward-auth redirects to the OAuth provider with `redirect_uri` set to `CALLBACK_URL`
+3. After login, the OAuth provider redirects the browser to `CALLBACK_URL?code=...&state=...`
+4. The centralized callback server exchanges the code, fetches user info, and redirects the browser back to the originating service's `/_auth/callback?handoff=<signed-token>`
+5. The reverse proxy forwards that to the primary forward-auth, which verifies the signed token, sets the session cookie on the correct domain, and redirects to the original destination
+
+The session cookie is always set on the originating service's domain. CSRF protection is preserved: a signed nonce ties the handoff token to the session cookie that was set before the OAuth redirect.
+
+> [!NOTE]
+> Per-request config overrides passed as query parameters (e.g. `?allowed_users=alice`) are supported — they are evaluated at the primary server, not the callback server. The callback server uses only environment-level configuration.
+
+### Traefik example
+
+Expose the callback server alongside the primary auth server and add it as the single registered redirect URI in your OAuth provider:
+
+```yaml
+services:
+  forward_auth:
+    image: ghcr.io/mkuhlmann/forward-auth
+    environment:
+      - APP_KEY=CHANGE_ME
+      - DISCOVERY_URL=https://idp.example.com
+      - CLIENT_ID=clientid
+      - CLIENT_SECRET=verysecret
+      - CALLBACK_PORT=8081
+      - CALLBACK_URL=https://auth-callback.example.com/callback
+    labels:
+      # Primary auth endpoint (internal, called by forward-auth middleware)
+      - 'traefik.http.routers.forward_auth.rule=PathPrefix(`/auth`)'
+      - 'traefik.http.routers.forward_auth.service=forward_auth'
+      - 'traefik.http.services.forward_auth.loadbalancer.server.port=8080'
+      # Centralized callback (public, called by the OAuth provider redirect)
+      - 'traefik.http.routers.callback.rule=Host(`auth-callback.example.com`)'
+      - 'traefik.http.routers.callback.service=callback'
+      - 'traefik.http.services.callback.loadbalancer.server.port=8081'
+```
+
+Register `https://auth-callback.example.com/callback` as the single allowed redirect URI in your OAuth provider. All protected services will share it.
 
 ## Usage
 
@@ -79,7 +136,7 @@ services:
     restart: unless-stopped
     environment:
       - APP_KEY=CHANGE_ME
-      # Either use discovery_url
+      # Either use DISCOVERY_URL
       - DISCOVERY_URL=https://example.com
       # OR specify individual endpoints
       # - AUTHORIZE_URL=https://example.com/oauth/authorize
@@ -101,7 +158,7 @@ services:
       - 'traefik.http.middlewares.forward_auth.forwardauth.authResponseHeaders=X-Auth-User,X-Auth-Info'
 ```
 
-Example nginx config, be sure to set redirect_code to 403!
+Example nginx config, be sure to set `REDIRECT_CODE=403`!
 
 ```nginxconf
 server {
